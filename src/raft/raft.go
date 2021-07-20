@@ -92,7 +92,6 @@ type Raft struct {
 
 type LogEntry struct{
 	Command		 interface{}
-	CommandIndex int
 	Term	 	 int
 }
 
@@ -196,7 +195,7 @@ func (rf *Raft) applyLoop(){
 		rf.mu.Lock()
 		for rf.lastApplied < rf.commitIndex{
 			rf.lastApplied++
-			msg := ApplyMsg{true, rf.log[rf.lastApplied].Command, rf.log[rf.lastApplied].CommandIndex}
+			msg := ApplyMsg{true, rf.log[rf.lastApplied].Command, rf.lastApplied}
 			rf.applyCh <- msg
 		}
 		rf.applyTimer.Reset(time.Duration(rf.applyInterval) * time.Millisecond)
@@ -309,9 +308,12 @@ func (rf *Raft) startElection(){
 		go func(id int){
 			var reply RequestVoteReply
 			res := rf.sendRequestVote(id, &args, &reply)
-			if args.Term < rf.currentTerm {return}
 			if res{
 				rf.mu.Lock()
+				if args.Term < rf.currentTerm {
+					rf.mu.Unlock()
+					return
+				}
 				if reply.Term > rf.currentTerm{
 					rf.becomeFollower(reply.Term)
 				}
@@ -398,6 +400,16 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+func (rf *Raft) canCommit(N int) bool{
+	cnt := 0
+	for id := range rf.peers{
+		if rf.matchIndex[id] >= N{
+			cnt++
+		}
+	}
+	return cnt > len(rf.peers) / 2
+}
+
 func (rf *Raft) pingLoop(){
 	rf.mu.Lock()
 	rf.heartbeatTimer = time.NewTimer(0)
@@ -419,7 +431,7 @@ func (rf *Raft) pingLoop(){
 			args[id].LeaderCommit = rf.commitIndex
 			args[id].Entries = make([]LogEntry, 0)
 			if len(rf.log) - 1 >= rf.nextIndex[id]{
-				for i := rf.nextIndex[id]; i <= len(rf.log) - 1; i++{
+				for i := rf.nextIndex[id]; i < len(rf.log); i++{
 					args[id].Entries = append(args[id].Entries, rf.log[i])
 				}
 			}
@@ -427,19 +439,33 @@ func (rf *Raft) pingLoop(){
 		rf.heartbeatTimer.Reset(time.Duration(rf.heartbeatInterval) * time.Millisecond)
 		rf.mu.Unlock()
 		for id := range rf.peers{
-			if id == rf.me {continue}
+			if id == rf.me {
+				rf.mu.Lock()
+				rf.nextIndex[id] = len(rf.log)
+				rf.matchIndex[id] = len(rf.log) - 1
+				rf.mu.Unlock()
+				continue
+			}
 			go func(id int) {
 				var reply AppendEntriesReply
 				res := rf.sendAppendEntries(id, &args[id], &reply)
-				if args[id].Term < rf.currentTerm {return}
 				if res{
 					rf.mu.Lock()
+					if args[id].Term < rf.currentTerm {
+						rf.mu.Unlock()
+						return
+					}
 					if reply.Term > rf.currentTerm{
 						rf.becomeFollower(reply.Term)
 					}
 					if reply.Success {
 						rf.nextIndex[id] = len(rf.log)
 						rf.matchIndex[id] = args[id].PrevLogIndex + len(args[id].Entries)
+						newCommit := rf.commitIndex
+						for ; newCommit + 1 < len(rf.log) && rf.canCommit(newCommit + 1); newCommit++ {}
+						if newCommit > rf.commitIndex && rf.log[newCommit].Term == rf.currentTerm{
+							rf.commitIndex = newCommit
+						}
 					} else {
 						if reply.Term == args[id].Term{
 							rf.nextIndex[id]--
@@ -472,7 +498,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
+	rf.mu.Lock()
+	if rf.state != Leader{
+		rf.mu.Unlock()
+		isLeader = false
+		return index, term, isLeader
+	}
+	index = len(rf.log)
+	term = rf.currentTerm
+	rf.log = append(rf.log, LogEntry{command, term})
+	rf.mu.Unlock()
 
 	return index, term, isLeader
 }
@@ -523,7 +558,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
-	rf.heartbeatInterval = 50
+	rf.heartbeatInterval = 80
 	rf.applyInterval = 10
 
 	rf.mu.Unlock()
