@@ -588,7 +588,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
-	rf.heartbeatInterval = 60
+	rf.heartbeatInterval = 55
 	rf.applyInterval = 10
 
 	rf.mu.Unlock()
