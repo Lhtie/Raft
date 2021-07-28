@@ -239,7 +239,7 @@ func (rn *Network) ProcessReq(req reqMsg) {
 		for replyOK == false && serverDead == false {
 			select {
 			case reply = <-ech:
-					replyOK = true
+				replyOK = true
 			case <-time.After(100 * time.Millisecond):
 				serverDead = rn.IsServerDead(req.endname, servername, server)
 				if serverDead {
