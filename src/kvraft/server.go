@@ -3,8 +3,8 @@ package raftkv
 import (
 	"Raft/labgob"
 	"Raft/labrpc"
-	"log"
 	"Raft/raft"
+	"log"
 	"sync"
 )
 
@@ -17,11 +17,24 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+const(Get_op = iota; Put_op; Append_op)
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Type	int
+	Id		int
+	Key		string
+	Value	string
+	Err		Err
+	DoneCh	chan Result
+}
+
+type Result struct{
+	prepared	bool
+	Value		string
+	Err			Err
 }
 
 type KVServer struct {
@@ -33,15 +46,119 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+
+	data		map[string]string
+	processed	map[int]Result
 }
 
+func (kv *KVServer) applyLoop(){
+	for {
+		msg := <-kv.applyCh
+		if msg.CommandValid{
+			res1, res2 := msg.Command.(Op)
+			isLeader := !res2
+			var op *Op
+			if !isLeader { op = &res1 } else { op = msg.Command.(*Op) }
+			kv.mu.Lock()
+			var ret Result
+			res, ok := kv.processed[op.Id]
+			if ok{
+				if res.prepared {
+					ret.Value = res.Value
+					ret.Err = res.Err
+				}
+				kv.mu.Unlock()
+				if isLeader {op.DoneCh <- ret}
+				continue
+			}
+			switch op.Type {
+				case Get_op:{
+					_, ok := kv.data[op.Key]
+					if !ok {
+						ret.Err = ErrNoKey
+					} else {
+						ret.Value = kv.data[op.Key]
+						ret.Err = OK
+					}
+				}
+				case Put_op:{
+					kv.data[op.Key] = op.Value
+					ret.Err = OK
+				}
+				case Append_op:{
+					_, ok := kv.data[op.Key]
+					if !ok {
+						kv.data[op.Key] = op.Value
+						ret.Err = ErrNoKey
+					} else {
+						kv.data[op.Key] += op.Value
+						ret.Err = OK
+					}
+				}
+			}
+			//if isLeader {
+			//	fmt.Println("who:", kv.me, "type:", op.Type, "key:", op.Key, "data:", kv.data[op.Key], "Err:", op.Err)
+			//}
+			kv.processed[op.Id] = Result{true, ret.Value, ret.Err}
+			kv.mu.Unlock()
+			if isLeader {op.DoneCh <- ret}
+		}
+	}
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	kv.mu.Lock()
+	res, ok := kv.processed[args.OpId]
+	if ok{
+		if res.prepared {
+			reply.WrongLeader = false
+			reply.Value = res.Value
+			reply.Err = res.Err
+		}
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+	op := Op{Get_op, args.OpId, args.Key, "", "", make(chan Result)}
+	_, _, isLeader := kv.rf.Start(&op)
+	if !isLeader{
+		reply.WrongLeader = true
+	} else {
+		ret := <-op.DoneCh
+		reply.WrongLeader = false
+		reply.Value = ret.Value
+		reply.Err = ret.Err
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	res, ok := kv.processed[args.OpId]
+	if ok{
+		if res.prepared {
+			reply.WrongLeader = false
+			reply.Err = res.Err
+		}
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+	op := Op{0, args.OpId, args.Key, args.Value, "", make(chan Result)}
+	if args.Op == "Put" {
+		op.Type = Put_op
+	} else {
+		op.Type = Append_op
+	}
+	_, _, isLeader := kv.rf.Start(&op)
+	if !isLeader{
+		reply.WrongLeader = true
+	} else {
+		ret := <-op.DoneCh
+		reply.WrongLeader = false
+		reply.Err = ret.Err
+	}
 }
 
 //
@@ -84,6 +201,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+
+	kv.data = make(map[string]string)
+	kv.processed = make(map[int]Result)
+	go kv.applyLoop()
 
 	return kv
 }

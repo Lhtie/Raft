@@ -1,2 +1,3 @@
 src/raft/tests
+src/kvraft/tests
 .idea
