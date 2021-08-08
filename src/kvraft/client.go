@@ -20,6 +20,7 @@ type Clerk struct {
 	// You will have to modify this struct.
 
 	mu				sync.Mutex
+	me				int
 	id 				int
 	timeoutInterval	int
 	timeoutTimer	*time.Timer
@@ -38,6 +39,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	// You'll have to add code here.
 
 	ck.id = -1
+	ck.me = int(nrand())
 	ck.timeoutInterval = 50
 	ck.timeoutTimer = time.NewTimer(0)
 	return ck
@@ -58,7 +60,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
 	totalOps.mu.Lock()
-	args := GetArgs{key, totalOps.cnt}
+	args := GetArgs{key, ck.me, totalOps.cnt}
 	totalOps.cnt++
 	totalOps.mu.Unlock()
 	doneCh := make(chan GetReply)
@@ -113,7 +115,7 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	totalOps.mu.Lock()
-	args := PutAppendArgs{key, value, op, totalOps.cnt}
+	args := PutAppendArgs{key, value, op, ck.me, totalOps.cnt}
 	totalOps.cnt++
 	totalOps.mu.Unlock()
 	doneCh := make(chan bool)

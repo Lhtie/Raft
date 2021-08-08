@@ -4,6 +4,7 @@ import (
 	"Raft/labgob"
 	"Raft/labrpc"
 	"Raft/raft"
+	"bytes"
 	"log"
 	"sync"
 )
@@ -24,6 +25,7 @@ type Op struct {
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 	Type	int
+	ClerkId int
 	Id		int
 	Key		string
 	Value	string
@@ -32,7 +34,7 @@ type Op struct {
 }
 
 type Result struct{
-	prepared	bool
+	Prepared	bool
 	Value		string
 	Err			Err
 }
@@ -48,7 +50,48 @@ type KVServer struct {
 	// Your definitions here.
 
 	data		map[string]string
+	lastOpId	map[int]int
 	processed	map[int]Result
+}
+
+func (kv *KVServer) snapshot(logIndex int){
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.data)
+	e.Encode(kv.lastOpId)
+	e.Encode(kv.processed)
+	data := w.Bytes()
+	kv.rf.ResizeLogEntries(logIndex, data)
+}
+
+func (kv *KVServer) readSnapshot(snapshot []byte) bool{
+	if snapshot == nil || len(snapshot) < 1 { // bootstrap without any state?
+		return false
+	}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var data map[string]string
+	var lastOpId map[int]int
+	var processed map[int]Result
+	if d.Decode(&data) == nil{
+		kv.data = data
+	} else {
+		return false
+	}
+	if d.Decode(&lastOpId) == nil{
+		kv.lastOpId = lastOpId
+	} else {
+		return false
+	}
+	if d.Decode(&processed) == nil{
+		kv.processed = processed
+	} else {
+		return false
+	}
+	return true
 }
 
 func (kv *KVServer) applyLoop(){
@@ -63,13 +106,21 @@ func (kv *KVServer) applyLoop(){
 			var ret Result
 			res, ok := kv.processed[op.Id]
 			if ok{
-				if res.prepared {
+				if res.Prepared {
 					ret.Value = res.Value
 					ret.Err = res.Err
 				}
 				kv.mu.Unlock()
 				if isLeader {op.DoneCh <- ret}
 				continue
+			}
+			if lastOpId, ok := kv.lastOpId[op.ClerkId]; ok{
+				if op.Id <= lastOpId{
+					ret.Err = None
+					kv.mu.Unlock()
+					if isLeader {op.DoneCh <- ret}
+					continue
+				}
 			}
 			switch op.Type {
 				case Get_op:{
@@ -97,11 +148,20 @@ func (kv *KVServer) applyLoop(){
 				}
 			}
 			//if isLeader {
-			//	fmt.Println("who:", kv.me, "type:", op.Type, "key:", op.Key, "data:", kv.data[op.Key], "Err:", op.Err)
+			//	fmt.Println("who:", kv.me, "type:", op.Type, "key:", op.Key, "data:", kv.data[op.Key], "OpId:", op.Id, "Err:", ret.Err)
 			//}
 			kv.processed[op.Id] = Result{true, ret.Value, ret.Err}
+			if lastOpId, ok := kv.lastOpId[op.ClerkId]; ok{
+				delete(kv.processed, lastOpId)
+			}
+			kv.lastOpId[op.ClerkId] = op.Id
+			if kv.maxraftstate > 0 && kv.maxraftstate - kv.rf.GetPersister().RaftStateSize() < 10{
+				kv.snapshot(msg.CommandIndex)
+			}
 			kv.mu.Unlock()
 			if isLeader {op.DoneCh <- ret}
+		} else {
+			kv.readSnapshot(msg.Snapshot)
 		}
 	}
 }
@@ -111,7 +171,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	res, ok := kv.processed[args.OpId]
 	if ok{
-		if res.prepared {
+		if res.Prepared {
 			reply.WrongLeader = false
 			reply.Value = res.Value
 			reply.Err = res.Err
@@ -119,8 +179,15 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		kv.mu.Unlock()
 		return
 	}
+	if lastOpId, ok := kv.lastOpId[args.ClerkId]; ok{
+		if args.OpId <= lastOpId{
+			reply.Err = None
+			kv.mu.Unlock()
+			return
+		}
+	}
 	kv.mu.Unlock()
-	op := Op{Get_op, args.OpId, args.Key, "", "", make(chan Result)}
+	op := Op{Get_op, args.ClerkId, args.OpId, args.Key, "", "", make(chan Result)}
 	_, _, isLeader := kv.rf.Start(&op)
 	if !isLeader{
 		reply.WrongLeader = true
@@ -137,15 +204,22 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	res, ok := kv.processed[args.OpId]
 	if ok{
-		if res.prepared {
+		if res.Prepared {
 			reply.WrongLeader = false
 			reply.Err = res.Err
 		}
 		kv.mu.Unlock()
 		return
 	}
+	if lastOpId, ok := kv.lastOpId[args.ClerkId]; ok{
+		if args.OpId <= lastOpId{
+			reply.Err = None
+			kv.mu.Unlock()
+			return
+		}
+	}
 	kv.mu.Unlock()
-	op := Op{0, args.OpId, args.Key, args.Value, "", make(chan Result)}
+	op := Op{0, args.ClerkId, args.OpId, args.Key, args.Value, "", make(chan Result)}
 	if args.Op == "Put" {
 		op.Type = Put_op
 	} else {
@@ -202,8 +276,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 
-	kv.data = make(map[string]string)
-	kv.processed = make(map[int]Result)
+	ok := kv.readSnapshot(kv.rf.GetPersister().ReadSnapshot())
+	if !ok {
+		kv.data = make(map[string]string)
+		kv.lastOpId = make(map[int]int)
+		kv.processed = make(map[int]Result)
+	}
 	go kv.applyLoop()
 
 	return kv
